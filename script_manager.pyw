@@ -2,6 +2,7 @@ import json
 import subprocess
 import sys
 import tkinter as tk
+import tkinter.font as tkfont
 import traceback
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
@@ -20,11 +21,15 @@ BORDER = "#2e333d"
 TEXT = "#e7e9ee"
 MUTED = "#8c94a6"
 ACCENT = "#4c8dff"  # Start button
-ACCENT_HOVER = "#6aa1ff"
+ACCENT_HOVER = "#6aa1ff"  # when the mouse is over it
+ACCENT_PRESS = "#3a78e6"  # while the mouse button is held down
 DANGER = "#d64550"  # Stop All button
 DANGER_HOVER = "#e5636d"
+DANGER_PRESS = "#bb3640"
 BTN = "#2a2f39"  # normal buttons
 BTN_HOVER = "#363c49"
+BTN_PRESS = "#20242c"
+BUTTON_RADIUS = 10  # how round the button corners are (0 = sharp, 18 = fully round ends)
 GREEN = "#3ecf8e"  # running
 RED = "#ff6b78"  # crashed / error lines
 SELECT = "#2a3a5c"  # highlighted table row
@@ -177,6 +182,73 @@ class ScriptManager:
         return data.decode("utf-8", errors="replace"), pos + len(data)
 
 
+class RoundedButton(tk.Canvas):
+    """A button with rounded corners.
+
+    ttk buttons can't have round corners, so we draw our own on a Canvas
+    (a blank drawing surface): a rounded rectangle with the text on top.
+    """
+
+    def __init__(
+        self, parent, text, command, bg, hover, press, fg, font, padx, pady, radius, min_width
+    ):
+        # Measure the text so the button is exactly wide/tall enough for it
+        label_font = tkfont.Font(font=font)
+        width = max(label_font.measure(text) + 2 * padx, min_width)
+        height = label_font.metrics("linespace") + 2 * pady
+        # bg=BG makes the corner pixels we don't paint blend into the window.
+        # highlightthickness=0 removes the canvas's own border.
+        super().__init__(
+            parent,
+            width=width,
+            height=height,
+            bg=BG,
+            highlightthickness=0,
+            borderwidth=0,
+            cursor="hand2",
+        )
+        self.command = command
+        self.colors = {"normal": bg, "hover": hover, "press": press}
+        self.pressed = False
+
+        # r = corner size. It can't be more than half the button's height or width.
+        r = min(radius, height // 2, width // 2)
+        x1, y1, x2, y2 = 1, 1, width - 2, height - 2
+        # The four corners of the rectangle, each listed twice. With smooth=True,
+        # Tk bends the line around each corner, which is what makes it round.
+        points = [
+            x1 + r, y1, x1 + r, y1, x2 - r, y1, x2 - r, y1,
+            x2, y1, x2, y1 + r, x2, y1 + r, x2, y2 - r, x2, y2 - r,
+            x2, y2, x2 - r, y2, x2 - r, y2, x1 + r, y2, x1 + r, y2,
+            x1, y2, x1, y2 - r, x1, y2 - r, x1, y1 + r, x1, y1 + r,
+            x1, y1,
+        ]  # fmt: skip
+        self.shape = self.create_polygon(points, smooth=True, fill=bg, outline=bg)
+        self.create_text(width // 2, height // 2, text=text, fill=fg, font=font)
+
+        self.bind("<Enter>", lambda e: self.paint("hover"))
+        self.bind("<Leave>", lambda e: self.paint("normal"))
+        self.bind("<ButtonPress-1>", self.on_press)
+        self.bind("<ButtonRelease-1>", self.on_release)
+
+    def paint(self, state):
+        color = self.colors[state]
+        self.itemconfig(self.shape, fill=color, outline=color)
+
+    def on_press(self, event):
+        self.pressed = True
+        self.paint("press")
+
+    def on_release(self, event):
+        # Only count it as a click if you let go while still over the button.
+        # (Press, drag away, release = cancelled, like a normal button.)
+        inside = 0 <= event.x < self.winfo_width() and 0 <= event.y < self.winfo_height()
+        self.paint("hover" if inside else "normal")
+        if self.pressed and inside:
+            self.command()
+        self.pressed = False
+
+
 class App:
     """The window only. It asks ScriptManager to do the real work."""
 
@@ -226,12 +298,6 @@ class App:
         style.configure("Muted.TLabel", foreground=MUTED)
         style.configure("Section.TLabel", foreground=MUTED, font=FONT_BOLD)
 
-        # buttons: same recipe three times, only the colors change
-        pad = (self.px(16), self.px(8))
-        self.button_style(style, "TButton", BTN, BTN_HOVER, TEXT, FONT, pad)
-        self.button_style(style, "Accent.TButton", ACCENT, ACCENT_HOVER, "#ffffff", FONT_BOLD, pad)
-        self.button_style(style, "Danger.TButton", DANGER, DANGER_HOVER, "#ffffff", FONT_BOLD, pad)
-
         # table
         style.configure(
             "Treeview",
@@ -275,28 +341,27 @@ class App:
             )
             style.map(name, background=[("active", BTN_HOVER)])
 
-    @staticmethod
-    def button_style(style, name, bg, hover, fg, font, padding):
-        # lightcolor/darkcolor/bordercolor are the 3D edges of a clam button.
-        # Setting them to the background color makes the button look flat.
-        style.configure(
-            name,
-            background=bg,
-            foreground=fg,
-            bordercolor=bg,
-            lightcolor=bg,
-            darkcolor=bg,
-            focuscolor=bg,
-            borderwidth=1,
-            padding=padding,
-            font=font,
-        )
-        style.map(
-            name,
-            background=[("active", hover)],
-            bordercolor=[("active", hover)],
-            lightcolor=[("active", hover)],
-            darkcolor=[("active", hover)],
+    def make_button(self, parent, text, command, kind="normal"):
+        # kind picks the colors: "normal" (gray), "accent" (blue) or "danger" (red)
+        colors = {
+            "normal": (BTN, BTN_HOVER, BTN_PRESS, TEXT, FONT),
+            "accent": (ACCENT, ACCENT_HOVER, ACCENT_PRESS, "#ffffff", FONT_BOLD),
+            "danger": (DANGER, DANGER_HOVER, DANGER_PRESS, "#ffffff", FONT_BOLD),
+        }
+        bg, hover, press, fg, font = colors[kind]
+        return RoundedButton(
+            parent,
+            text,
+            command,
+            bg,
+            hover,
+            press,
+            fg,
+            font,
+            padx=self.px(16),
+            pady=self.px(8),
+            radius=self.px(BUTTON_RADIUS),
+            min_width=self.px(104),
         )
 
     def build_window(self):
@@ -357,17 +422,11 @@ class App:
         # --- buttons ---
         bar = ttk.Frame(root)
         bar.pack(fill="x", padx=pad, pady=(self.px(14), self.px(14)))
-        ttk.Button(bar, text="Add Script", cursor="hand2", command=self.on_add).pack(side="left")
-        ttk.Button(bar, text="Remove", cursor="hand2", command=self.on_remove).pack(
-            side="left", padx=(gap, 0)
-        )
-        ttk.Button(
-            bar, text="Stop All", style="Danger.TButton", cursor="hand2", command=self.on_stop_all
-        ).pack(side="right")
-        ttk.Button(bar, text="Stop", cursor="hand2", command=self.on_stop).pack(side="right", padx=gap)
-        ttk.Button(
-            bar, text="Start", style="Accent.TButton", cursor="hand2", command=self.on_start
-        ).pack(side="right")
+        self.make_button(bar, "Add Script", self.on_add).pack(side="left")
+        self.make_button(bar, "Remove", self.on_remove).pack(side="left", padx=(gap, 0))
+        self.make_button(bar, "Stop All", self.on_stop_all, "danger").pack(side="right")
+        self.make_button(bar, "Stop", self.on_stop).pack(side="right", padx=gap)
+        self.make_button(bar, "Start", self.on_start, "accent").pack(side="right")
 
         # --- output box ---
         self.log_label = ttk.Label(root, text="Output", style="Section.TLabel")
