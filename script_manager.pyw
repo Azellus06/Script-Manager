@@ -1,17 +1,29 @@
 import json
+import math
+import os
 import subprocess
 import sys
+import threading
+import time
 import tkinter as tk
 import tkinter.font as tkfont
 import traceback
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
 
+# The emergency-stop hotkey needs the "keyboard" library (pip install keyboard).
+# It's optional: without it, everything else still works.
+try:
+    import keyboard
+except Exception:
+    keyboard = None
+
 # scripts.json and the logs folder are saved in the same folder as this file
 BASE_DIR = Path(__file__).parent
 DATA_FILE = BASE_DIR / "scripts.json"
 LOG_DIR = BASE_DIR / "logs"
 MAX_LOG_LINES = 2000  # the output box only keeps the newest 2000 lines
+EMERGENCY_HOTKEY = "ctrl+alt+x"  # press this anywhere to stop every script
 
 # ---------- look & feel (change a color here and the whole window follows) ----------
 BG = "#15171c"  # window background
@@ -20,7 +32,7 @@ PANEL_ALT = "#22262e"  # every second table row (stripes)
 BORDER = "#2e333d"
 TEXT = "#e7e9ee"
 MUTED = "#8c94a6"
-ACCENT = "#4c8dff"  # Start button
+ACCENT = "#4c8dff"  # Start button, ticked checkbox
 ACCENT_HOVER = "#6aa1ff"  # when the mouse is over it
 ACCENT_PRESS = "#3a78e6"  # while the mouse button is held down
 DANGER = "#d64550"  # Stop All button
@@ -35,6 +47,8 @@ RED = "#ff6b78"  # crashed / error lines
 SELECT = "#2a3a5c"  # highlighted table row
 LOG_BG = "#0f1115"  # output box
 LOG_TEXT = "#d5d9e2"
+CHECK_OFF_BORDER = "#586075"  # outline of an unticked checkbox
+CHECK_OFF_FILL = "#0f1115"  # inside of an unticked checkbox
 
 FONT = ("Segoe UI", 10)
 FONT_BOLD = ("Segoe UI", 10, "bold")
@@ -44,13 +58,96 @@ MONO = ("Consolas", 10)
 STATUS_ICONS = {"running": "●", "stopped": "○", "finished": "✓", "crashed": "✕"}
 
 
+def open_in_system(path):
+    """Open a file or folder the way double-clicking it would."""
+    if sys.platform == "win32":
+        os.startfile(path)  # Windows only
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", str(path)])
+    else:
+        subprocess.Popen(["xdg-open", str(path)])
+
+
+def plural(n, word):
+    return f"{n} {word}" if n == 1 else f"{n} {word}s"
+
+
+def hex_to_rgb(color):
+    return tuple(int(color[i : i + 2], 16) for i in (1, 3, 5))
+
+
+def draw_checkbox(master, size, checked, bg, width=None):
+    """Draws a checkbox as a small image and returns it.
+
+    A table cell can't hold a real checkbox widget, but it can hold a picture,
+    so we paint one pixel by pixel. `bg` is the color of the row behind it.
+    `width` = make the picture as wide as the table column, with the box in the
+    middle, so the checkbox ends up centered under its heading.
+    """
+    SS = 4  # each final pixel = 4x4 sub-samples, averaged, so the edges look smooth
+    bg_rgb = hex_to_rgb(bg)
+    outline_rgb = hex_to_rgb(ACCENT if checked else CHECK_OFF_BORDER)
+    inside_rgb = hex_to_rgb(ACCENT if checked else CHECK_OFF_FILL)
+    white = (255, 255, 255)
+
+    half = size / 2
+    reach = half - 1  # half the box's width (1px margin so the smooth edge isn't cut off)
+    radius = size * 0.26  # how round the box corners are
+    border = max(1.4, size * 0.09)  # outline thickness of an unticked box
+    stroke = max(1.6, size * 0.13) / 2  # half the thickness of the tick mark
+    # The tick is two line segments: short one down-right, long one up-right
+    tick = [(0.27 * size, 0.53 * size), (0.43 * size, 0.69 * size), (0.74 * size, 0.34 * size)]
+
+    def box_distance(x, y):
+        # Negative inside the rounded square, positive outside it
+        dx = abs(x - half) - (reach - radius)
+        dy = abs(y - half) - (reach - radius)
+        return math.hypot(max(dx, 0), max(dy, 0)) + min(max(dx, dy), 0) - radius
+
+    def segment_distance(x, y, a, b):
+        ax, ay = a
+        bx, by = b
+        t = ((x - ax) * (bx - ax) + (y - ay) * (by - ay)) / ((bx - ax) ** 2 + (by - ay) ** 2)
+        t = max(0, min(1, t))
+        return math.hypot(x - (ax + t * (bx - ax)), y - (ay + t * (by - ay)))
+
+    def color_at(x, y):
+        d = box_distance(x, y)
+        if d > 0:
+            return bg_rgb
+        if checked:
+            on_tick = min(segment_distance(x, y, tick[0], tick[1]), segment_distance(x, y, tick[1], tick[2]))
+            return white if on_tick <= stroke else inside_rgb
+        return outline_rgb if d > -border else inside_rgb
+
+    full_width = width or size
+    image = tk.PhotoImage(master=master, width=full_width, height=size)
+    image.put(bg, to=(0, 0, full_width, size))  # fill everything with the row color first
+    rows = []
+    for py in range(size):
+        row = []
+        for px in range(size):
+            total = [0, 0, 0]
+            for sy in range(SS):
+                for sx in range(SS):
+                    r, g, b = color_at(px + (sx + 0.5) / SS, py + (sy + 0.5) / SS)
+                    total[0] += r
+                    total[1] += g
+                    total[2] += b
+            n = SS * SS
+            row.append("#%02x%02x%02x" % (total[0] // n, total[1] // n, total[2] // n))
+        rows.append("{" + " ".join(row) + "}")
+    image.put(" ".join(rows), to=((full_width - size) // 2, 0))  # box goes in the middle
+    return image
+
+
 class ScriptEntry:
     """One script in the list."""
 
-    def __init__(self, name, path, description=""):
+    def __init__(self, name, path, autostart=False):
         self.name = name
         self.path = Path(path)
-        self.description = description
+        self.autostart = autostart  # start this script when the manager opens?
         self.process = None  # holds the running process, or None when stopped
 
     @property
@@ -80,15 +177,12 @@ class ScriptEntry:
 
     def to_dict(self):
         # Path objects can't go into JSON, so we turn the path into plain text
-        return {
-            "name": self.name,
-            "path": str(self.path),
-            "description": self.description,
-        }
+        return {"name": self.name, "path": str(self.path), "autostart": self.autostart}
 
     @classmethod
     def from_dict(cls, d):
-        return cls(d["name"], d["path"], d.get("description", ""))
+        # .get(..., False): old files saved before auto-start existed still load (unticked)
+        return cls(d["name"], d["path"], d.get("autostart", False))
 
 
 class ScriptManager:
@@ -112,13 +206,39 @@ class ScriptManager:
         with open(self.data_file, "w", encoding="utf-8") as f:
             json.dump([e.to_dict() for e in self.entries], f, indent=2)
 
-    def add_script(self, path):
+    def add_script(self, path, save=True):
         path = Path(path)
         if any(e.path == path for e in self.entries):
             return False  # already in the list
         self.entries.append(ScriptEntry(path.stem, path))
-        self.save()
+        if save:
+            self.save()
         return True
+
+    def add_folder(self, folder):
+        """Adds every .py / .pyw file directly inside `folder` (not its subfolders).
+
+        Returns (added, skipped). Example: a folder with a.py, b.pyw and notes.txt,
+        where a.py is already in the list -> (1, 1).
+        """
+        own_file = Path(__file__).resolve()
+        added = skipped = 0
+        for path in sorted(Path(folder).iterdir(), key=lambda p: p.name.lower()):
+            if not path.is_file() or path.suffix.lower() not in (".py", ".pyw"):
+                continue
+            if path.name.startswith("_") or path.resolve() == own_file:
+                continue  # skip helper files like __init__.py, and this manager itself
+            if self.add_script(path, save=False):
+                added += 1
+            else:
+                skipped += 1
+        if added:
+            self.save()
+        return added, skipped
+
+    def set_autostart(self, entry, value):
+        entry.autostart = value
+        self.save()
 
     def remove_script(self, entry):
         self.stop(entry)  # don't leave a removed script running with no way to stop it
@@ -260,17 +380,21 @@ class App:
         self.viewed_entry = None  # whose log is in the output box right now
         self.log_pos = 0  # how many bytes of that log we've already shown
         self.in_traceback = False  # are we in the middle of printing an error report?
+        self.flash_until = 0.0  # a red message in the header is shown until this time
 
         # On a high-resolution screen, 1 "pixel" in our code would look tiny.
         # scale = 1.0 on a normal screen, 1.5 on a 150% screen, and so on.
         self.scale = max(1.0, root.winfo_fpixels("1i") / 96)
+        self.font_normal = tkfont.Font(font=FONT)  # used to measure text widths
+        self.auto_col_width = self.px(96)  # width of the Auto-start column
 
         root.title("Script Manager")
         root.configure(bg=BG)
-        root.geometry(f"{self.px(780)}x{self.px(620)}")
-        root.minsize(self.px(640), self.px(480))
+        root.geometry(f"{self.px(840)}x{self.px(680)}")
+        root.minsize(self.px(740), self.px(520))
 
         self.setup_style()
+        self.make_checkbox_images()
         self.build_window()
 
         # Clicking the window's X button sends an event named WM_DELETE_WINDOW.
@@ -279,7 +403,9 @@ class App:
 
         self.refresh_table()
         self.clear_log_view()
+        self.setup_emergency_hotkey()
         self.tick()  # starts the once-per-second loop
+        self.start_autostart_scripts()
 
     def px(self, n):
         return int(n * self.scale)
@@ -314,6 +440,23 @@ class App:
             foreground=[("selected", TEXT)],
         )
         style.layout("Treeview", [("Treeview.treearea", {"sticky": "nswe"})])  # no outer border
+        # Each row = a picture + text. We drop the default little expand/collapse arrow
+        # (we don't use it) so the checkbox picture sits where we want it.
+        style.layout(
+            "Treeview.Item",
+            [
+                (
+                    "Treeitem.padding",
+                    {
+                        "sticky": "nswe",
+                        "children": [
+                            ("Treeitem.image", {"side": "left", "sticky": ""}),
+                            ("Treeitem.text", {"side": "left", "sticky": ""}),
+                        ],
+                    },
+                )
+            ],
+        )
         style.configure(
             "Treeview.Heading",
             background=BG,
@@ -325,8 +468,12 @@ class App:
         )
         style.map("Treeview.Heading", background=[("active", BG)])
 
-        # scrollbars (one for the table, one for the darker output box)
-        for name, trough in (("Vertical.TScrollbar", PANEL), ("Log.Vertical.TScrollbar", LOG_BG)):
+        # scrollbars (table: vertical + horizontal; and one for the darker output box)
+        for name, trough in (
+            ("Vertical.TScrollbar", PANEL),
+            ("Horizontal.TScrollbar", PANEL),
+            ("Log.Vertical.TScrollbar", LOG_BG),
+        ):
             style.configure(
                 name,
                 background=BTN,
@@ -341,7 +488,16 @@ class App:
             )
             style.map(name, background=[("active", BTN_HOVER)])
 
-    def make_button(self, parent, text, command, kind="normal"):
+    def make_checkbox_images(self):
+        # One picture per (ticked or not) x (row background). The background matters
+        # because the picture's corners must blend into the row behind it.
+        size = self.px(18)
+        self.checkbox_images = {}
+        for checked in (False, True):
+            for state, color in (("even", PANEL), ("odd", PANEL_ALT), ("select", SELECT)):
+                self.checkbox_images[(checked, state)] = draw_checkbox(self.root, size, checked, color, self.auto_col_width)
+
+    def make_button(self, parent, text, command, kind="normal", small=False):
         # kind picks the colors: "normal" (gray), "accent" (blue) or "danger" (red)
         colors = {
             "normal": (BTN, BTN_HOVER, BTN_PRESS, TEXT, FONT),
@@ -349,19 +505,17 @@ class App:
             "danger": (DANGER, DANGER_HOVER, DANGER_PRESS, "#ffffff", FONT_BOLD),
         }
         bg, hover, press, fg, font = colors[kind]
+        if small:
+            padx, pady, radius, min_width = self.px(12), self.px(4), self.px(8), self.px(88)
+        else:
+            padx, pady, radius, min_width = (
+                self.px(16),
+                self.px(8),
+                self.px(BUTTON_RADIUS),
+                self.px(104),
+            )
         return RoundedButton(
-            parent,
-            text,
-            command,
-            bg,
-            hover,
-            press,
-            fg,
-            font,
-            padx=self.px(16),
-            pady=self.px(8),
-            radius=self.px(BUTTON_RADIUS),
-            min_width=self.px(104),
+            parent, text, command, bg, hover, press, fg, font, padx, pady, radius, min_width
         )
 
     def build_window(self):
@@ -372,7 +526,11 @@ class App:
         # --- header ---
         header = ttk.Frame(root)
         header.pack(fill="x", padx=pad, pady=(pad, self.px(12)))
-        ttk.Label(header, text="Script Manager", style="Title.TLabel").pack(side="left")
+        left = ttk.Frame(header)
+        left.pack(side="left")
+        ttk.Label(left, text="Script Manager", style="Title.TLabel").pack(anchor="w")
+        self.hotkey_label = ttk.Label(left, text="", style="Muted.TLabel")
+        self.hotkey_label.pack(anchor="w")
         self.summary_label = ttk.Label(header, text="", style="Muted.TLabel")
         self.summary_label.pack(side="right", anchor="s", pady=(0, 3))
 
@@ -382,23 +540,29 @@ class App:
         table_inner = tk.Frame(table_border, bg=PANEL)
         table_inner.pack(fill="both", expand=True, padx=1, pady=1)
 
+        # show="tree headings": the first column (called "#0") is where the checkbox pictures go
         self.tree = ttk.Treeview(
             table_inner,
             columns=("name", "status", "path"),
-            show="headings",
+            show="tree headings",
             height=6,
             selectmode="browse",  # one row at a time
         )
+        self.tree.heading("#0", text="Auto-start", anchor="center")
+        self.tree.column("#0", width=self.auto_col_width, anchor="center", stretch=False)
         for col, title, width, stretch in (
             ("name", "Script", 170, False),
             ("status", "Status", 160, False),
-            ("path", "Path", 420, True),
+            ("path", "Path", 420, False),  # width is set by fit_path_column
         ):
             self.tree.heading(col, text=title, anchor="w")
             self.tree.column(col, width=self.px(width), anchor="w", stretch=stretch)
         tree_scroll = ttk.Scrollbar(table_inner, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=tree_scroll.set)
+        self.hscroll = ttk.Scrollbar(table_inner, orient="horizontal", command=self.tree.xview)
+        # xscrollcommand = "tell me how much is visible"; we use it to hide the bar when not needed
+        self.tree.configure(yscrollcommand=tree_scroll.set, xscrollcommand=self.on_hscroll)
         tree_scroll.pack(side="right", fill="y")
+        self.hscroll.pack(side="bottom", fill="x")
         self.tree.pack(side="left", fill="both", expand=True)
 
         # Row colors. A row gets two tags: a stripe tag (background) and a status tag (text color).
@@ -408,11 +572,16 @@ class App:
         self.tree.tag_configure("crashed", foreground=RED)
         # Fires whenever you click a different row
         self.tree.bind("<<TreeviewSelect>>", self.on_select)
+        # Clicks in the checkbox column toggle auto-start; the hand cursor shows it's clickable
+        self.tree.bind("<Button-1>", self.on_tree_click)
+        self.tree.bind("<Motion>", self.on_tree_motion)
+        # Re-fit the Path column whenever the window is resized
+        self.tree.bind("<Configure>", self.fit_path_column)
 
         # Shown on top of the empty table
         self.empty_label = tk.Label(
             self.tree,
-            text='No scripts yet.\nClick "Add Script" to add your first one.',
+            text='No scripts yet.\nClick "Add Script" or "Add Folder" to get started.',
             bg=PANEL,
             fg=MUTED,
             font=FONT,
@@ -423,14 +592,21 @@ class App:
         bar = ttk.Frame(root)
         bar.pack(fill="x", padx=pad, pady=(self.px(14), self.px(14)))
         self.make_button(bar, "Add Script", self.on_add).pack(side="left")
+        self.make_button(bar, "Add Folder", self.on_add_folder).pack(side="left", padx=(gap, 0))
         self.make_button(bar, "Remove", self.on_remove).pack(side="left", padx=(gap, 0))
         self.make_button(bar, "Stop All", self.on_stop_all, "danger").pack(side="right")
         self.make_button(bar, "Stop", self.on_stop).pack(side="right", padx=gap)
         self.make_button(bar, "Start", self.on_start, "accent").pack(side="right")
 
         # --- output box ---
-        self.log_label = ttk.Label(root, text="Output", style="Section.TLabel")
-        self.log_label.pack(anchor="w", padx=pad)
+        log_header = ttk.Frame(root)
+        log_header.pack(fill="x", padx=pad)
+        self.log_label = ttk.Label(log_header, text="Output", style="Section.TLabel")
+        self.log_label.pack(side="left")
+        self.make_button(log_header, "Open Folder", self.on_open_folder, small=True).pack(side="right")
+        self.make_button(log_header, "Open Log", self.on_open_log, small=True).pack(
+            side="right", padx=(0, gap)
+        )
         log_border = tk.Frame(root, bg=BORDER)
         log_border.pack(fill="both", expand=True, padx=pad, pady=(self.px(8), pad))
         log_inner = tk.Frame(log_border, bg=LOG_BG)
@@ -462,6 +638,43 @@ class App:
         self.log_text.tag_configure("error", foreground=RED)
         self.log_text.tag_configure("hint", foreground=MUTED)
 
+    # ---------- emergency stop ----------
+
+    def setup_emergency_hotkey(self):
+        # threading.Event = a flag that is safe to raise from any thread
+        self.emergency = threading.Event()
+        ok = False
+        if keyboard is not None:
+            try:
+                # The keyboard library calls this function from ITS OWN thread when you
+                # press the keys. tkinter must only be touched from the main thread, so
+                # the callback does just one safe thing: raise the flag.
+                keyboard.add_hotkey(EMERGENCY_HOTKEY, self.emergency.set)
+                ok = True
+            except Exception:
+                pass  # e.g. on Linux the keyboard library needs root
+        if ok:
+            pretty = "+".join(part.capitalize() for part in EMERGENCY_HOTKEY.split("+"))
+            self.hotkey_label.config(text=f"Emergency stop: {pretty}")
+        else:
+            self.hotkey_label.config(text="Emergency stop hotkey unavailable (pip install keyboard)")
+        self.check_emergency()
+
+    def check_emergency(self):
+        # The main thread looks at the flag 10 times a second
+        if self.emergency.is_set():
+            self.emergency.clear()
+            running = sum(1 for e in self.manager.entries if e.is_running())
+            self.manager.stop_all()
+            self.refresh_table()
+            self.flash_message(f"Emergency stop: stopped {plural(running, 'script')}")
+        self.root.after(100, self.check_emergency)
+
+    def flash_message(self, text, seconds=5):
+        # Show a red message in the header for a few seconds
+        self.flash_until = time.time() + seconds
+        self.summary_label.config(text=text, foreground=RED)
+
     # ---------- table ----------
 
     def tick(self):
@@ -490,10 +703,61 @@ class App:
         return ("odd" if i % 2 else "even", entry.status_kind())
 
     def update_summary(self):
+        if time.time() < self.flash_until:
+            return  # a red message is being shown; don't overwrite it yet
         total = len(self.manager.entries)
         running = sum(1 for e in self.manager.entries if e.is_running())
-        word = "script" if total == 1 else "scripts"
-        self.summary_label.config(text=f"{total} {word}  ·  {running} running")
+        self.summary_label.config(
+            text=f"{plural(total, 'script')}  ·  {running} running", foreground=MUTED
+        )
+
+    def checkbox_image(self, i, entry, selected):
+        state = "select" if selected else ("odd" if i % 2 else "even")
+        return self.checkbox_images[(entry.autostart, state)]
+
+    def refresh_checkboxes(self):
+        # A highlighted row has a different background, so it needs its own checkbox picture
+        selected = self.tree.selection()
+        for i, entry in enumerate(self.manager.entries):
+            iid = str(i)
+            if self.tree.exists(iid):
+                self.tree.item(iid, image=self.checkbox_image(i, entry, iid in selected))
+
+    def fit_path_column(self, event=None):
+        # The Path column is as wide as the longest path, or as wide as the leftover
+        # window space if that's bigger (so a short path doesn't leave a gap).
+        # If the longest path is wider than the window, the horizontal scrollbar appears.
+        longest = max((self.font_normal.measure(str(e.path)) for e in self.manager.entries), default=0)
+        needed = max(self.px(420), longest + self.px(32))
+        others = sum(self.tree.column(c, "width") for c in ("#0", "name", "status"))
+        leftover = self.tree.winfo_width() - others
+        self.tree.column("path", width=max(needed, leftover))
+
+    def on_hscroll(self, first, last):
+        # first/last = which part of the table is visible, from 0.0 to 1.0.
+        # Example: (0.0, 0.6) = the left 60% is visible, so there IS more to scroll to.
+        self.hscroll.set(first, last)
+        if float(first) <= 0.0 and float(last) >= 1.0:
+            self.hscroll.pack_forget()  # everything fits -> no scrollbar needed
+        else:
+            self.hscroll.pack(side="bottom", fill="x", before=self.tree)
+
+    def on_tree_click(self, event):
+        if self.tree.identify_column(event.x) != "#0":
+            return  # a click anywhere else: let the table select the row as usual
+        iid = self.tree.identify_row(event.y)
+        if not iid:
+            return  # clicked the column header
+        entry = self.manager.entries[int(iid)]
+        self.manager.set_autostart(entry, not entry.autostart)
+        self.refresh_checkboxes()
+        return "break"  # handled: don't also select the row
+
+    def on_tree_motion(self, event):
+        over_checkbox = (
+            self.tree.identify_column(event.x) == "#0" and self.tree.identify_row(event.y) != ""
+        )
+        self.tree.configure(cursor="hand2" if over_checkbox else "")
 
     def refresh_table(self):
         selected = self.tree.selection()  # remember it, e.g. ("2",)
@@ -504,6 +768,8 @@ class App:
                 "",
                 "end",
                 iid=str(i),
+                text="",
+                image=self.checkbox_image(i, entry, False),
                 values=(entry.name, self.status_label(entry), str(entry.path)),
                 tags=self.row_tags(i, entry),
             )
@@ -512,6 +778,8 @@ class App:
         for iid in selected:
             if self.tree.exists(iid):
                 self.tree.selection_set(iid)
+        self.refresh_checkboxes()
+        self.fit_path_column()
         # Show the "No scripts yet" hint only when the table is empty
         if self.manager.entries:
             self.empty_label.place_forget()
@@ -584,6 +852,7 @@ class App:
             self.append_log(text)
 
     def on_select(self, event=None):
+        self.refresh_checkboxes()  # the highlighted row needs its own checkbox picture
         entry = self.get_selected()
         # Rebuilding the table briefly empties the selection; ignore that so
         # the output box doesn't blank out every time you click a button.
@@ -603,6 +872,24 @@ class App:
         if not self.manager.add_script(path):
             messagebox.showinfo("Already added", "That script is already in the list.")
         self.refresh_table()
+
+    def on_add_folder(self):
+        folder = filedialog.askdirectory(title="Choose a folder of scripts")
+        if not folder:  # Cancel
+            return
+        try:
+            added, skipped = self.manager.add_folder(folder)
+        except OSError as error:
+            messagebox.showerror("Can't read folder", str(error))
+            return
+        self.refresh_table()
+        if added == 0 and skipped == 0:
+            message = "No .py or .pyw files found in that folder."
+        else:
+            message = f"Added {plural(added, 'script')}."
+            if skipped:
+                message += f"\n{skipped} already in the list."
+        messagebox.showinfo("Add Folder", message)
 
     def on_remove(self):
         entry = self.get_selected()
@@ -637,8 +924,45 @@ class App:
         self.manager.stop_all()
         self.refresh_table()
 
+    def on_open_log(self):
+        entry = self.viewed_entry
+        if entry is None:
+            messagebox.showinfo("Open Log", "Select a script first.")
+        elif not entry.log_path.exists():
+            messagebox.showinfo("Open Log", f"{entry.name} has no log yet. Start it first.")
+        else:
+            self.open_path(entry.log_path)
+
+    def on_open_folder(self):
+        entry = self.viewed_entry
+        if entry is None:
+            messagebox.showinfo("Open Folder", "Select a script first.")
+        elif not entry.path.parent.exists():
+            messagebox.showerror("Open Folder", f"Folder not found:\n{entry.path.parent}")
+        else:
+            self.open_path(entry.path.parent)
+
+    @staticmethod
+    def open_path(path):
+        try:
+            open_in_system(path)
+        except OSError as error:
+            messagebox.showerror("Can't open", str(error))
+
+    def start_autostart_scripts(self):
+        # Only scripts whose Auto-start box you ticked. Nothing runs by itself otherwise.
+        for entry in self.manager.entries:
+            if entry.autostart:
+                self.manager.start(entry)
+        self.refresh_table()
+
     def on_close(self):
         self.manager.stop_all()
+        if keyboard is not None:
+            try:
+                keyboard.unhook_all()
+            except Exception:
+                pass
         self.root.destroy()
 
 
