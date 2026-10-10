@@ -47,6 +47,9 @@ RED = "#ff6b78"  # crashed / error lines
 SELECT = "#2a3a5c"  # highlighted table row
 LOG_BG = "#0f1115"  # output box
 LOG_TEXT = "#d5d9e2"
+SCROLL_THUMB = "#3a4150"  # scrollbar handle
+SCROLL_HOVER = "#59637a"  # when the mouse is over it
+SCROLL_DRAG = ACCENT  # while you are dragging it
 CHECK_OFF_BORDER = "#586075"  # outline of an unticked checkbox
 CHECK_OFF_FILL = "#0f1115"  # inside of an unticked checkbox
 
@@ -302,6 +305,145 @@ class ScriptManager:
         return data.decode("utf-8", errors="replace"), pos + len(data)
 
 
+class RoundedScrollbar(tk.Canvas):
+    """A slim scrollbar with a rounded handle, drawn on a Canvas.
+
+    It plugs in exactly like a normal scrollbar:
+        bar = RoundedScrollbar(parent, "vertical", command=text.yview, ...)
+        text.configure(yscrollcommand=bar.set)
+    The widget calls bar.set(first, last) to say what part is visible
+    (example: 0.25, 0.75 = the middle half), and we call `command` when you scroll.
+    """
+
+    def __init__(self, parent, orient, command, track, thickness, thin, wide):
+        self.vertical = orient == "vertical"
+        super().__init__(
+            parent,
+            width=thickness if self.vertical else 1,
+            height=1 if self.vertical else thickness,
+            bg=track,  # the track is just the canvas background
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        self.command = command
+        self.thickness = thickness
+        self.thin = thin  # handle thickness normally
+        self.wide = wide  # handle thickness when hovered / dragged
+        self.min_handle = wide * 3  # never let the handle get smaller than this
+        self.first, self.last = 0.0, 1.0  # visible part, e.g. 0.25 and 0.75
+        self.hovering = False
+        self.dragging = False
+        self.grab_offset = 0  # where inside the handle you grabbed it
+
+        self.bind("<Configure>", lambda e: self.draw())
+        self.bind("<Motion>", self.on_motion)
+        self.bind("<Leave>", self.on_leave)
+        self.bind("<ButtonPress-1>", self.on_press)
+        self.bind("<B1-Motion>", self.on_drag)
+        self.bind("<ButtonRelease-1>", self.on_release)
+        self.bind("<MouseWheel>", lambda e: self.wheel(-1 if e.delta > 0 else 1))  # Windows
+        self.bind("<Button-4>", lambda e: self.wheel(-1))  # Linux
+        self.bind("<Button-5>", lambda e: self.wheel(1))
+
+    def set(self, first, last):
+        # Called by the table / text box whenever the view changes
+        self.first, self.last = float(first), float(last)
+        self.draw()
+
+    # --- geometry ---
+
+    def track_length(self):
+        return self.winfo_height() if self.vertical else self.winfo_width()
+
+    def handle_span(self):
+        """(start, end) of the handle in pixels along the bar, or None if all is visible.
+
+        Example: bar is 200px long, 0.25..0.75 visible -> handle is 100px long.
+        The handle can only travel 100px (200 - 100), and first=0.25 out of a possible
+        0.5 (1 - 0.5 visible) is halfway, so it starts at 50px: (50, 150).
+        """
+        length = self.track_length()
+        visible = self.last - self.first
+        if visible >= 1 or length <= 1:
+            return None
+        size = min(max(visible * length, self.min_handle), length)
+        start = self.first / (1 - visible) * (length - size)
+        return start, start + size
+
+    def draw(self):
+        self.delete("all")
+        span = self.handle_span()
+        if span is None:
+            return
+        start, end = span
+        thick = self.wide if (self.hovering or self.dragging) else self.thin
+        color = SCROLL_DRAG if self.dragging else (SCROLL_HOVER if self.hovering else SCROLL_THUMB)
+        r = thick / 2
+        # A thick line with round ends is a perfect pill shape.
+        # The round end sticks out by r, so we pull the line's ends in by r.
+        if self.vertical:
+            mid = self.winfo_width() / 2
+            self.create_line(mid, start + r, mid, end - r, width=thick, fill=color, capstyle="round")
+        else:
+            mid = self.winfo_height() / 2
+            self.create_line(start + r, mid, end - r, mid, width=thick, fill=color, capstyle="round")
+
+    # --- mouse ---
+
+    def along(self, event):
+        return event.y if self.vertical else event.x
+
+    def over_handle(self, event):
+        span = self.handle_span()
+        return span is not None and span[0] <= self.along(event) <= span[1]
+
+    def on_motion(self, event):
+        if self.dragging:
+            return
+        over = self.over_handle(event)
+        if over != self.hovering:
+            self.hovering = over
+            self.draw()
+
+    def on_leave(self, event):
+        if not self.dragging and self.hovering:
+            self.hovering = False
+            self.draw()
+
+    def on_press(self, event):
+        span = self.handle_span()
+        if span is None:
+            return
+        if span[0] <= self.along(event) <= span[1]:
+            self.dragging = True
+            self.grab_offset = self.along(event) - span[0]
+            self.draw()
+        else:
+            # Click on the empty track: jump one page toward the click
+            self.command("scroll", -1 if self.along(event) < span[0] else 1, "pages")
+
+    def on_drag(self, event):
+        span = self.handle_span()
+        if not self.dragging or span is None:
+            return
+        room = self.track_length() - (span[1] - span[0])  # how far the handle can travel
+        if room <= 0:
+            return
+        start = min(max(self.along(event) - self.grab_offset, 0), room)
+        # Reverse of handle_span: pixels -> fraction. Example: start=50, room=100,
+        # visible=0.5 -> first = 50/100 * (1 - 0.5) = 0.25
+        self.command("moveto", start / room * (1 - (self.last - self.first)))
+
+    def on_release(self, event):
+        if self.dragging:
+            self.dragging = False
+            self.hovering = self.over_handle(event)
+            self.draw()
+
+    def wheel(self, direction):
+        self.command("scroll", direction * 3, "units")
+
+
 class RoundedButton(tk.Canvas):
     """A button with rounded corners.
 
@@ -468,26 +610,6 @@ class App:
         )
         style.map("Treeview.Heading", background=[("active", BG)])
 
-        # scrollbars (table: vertical + horizontal; and one for the darker output box)
-        for name, trough in (
-            ("Vertical.TScrollbar", PANEL),
-            ("Horizontal.TScrollbar", PANEL),
-            ("Log.Vertical.TScrollbar", LOG_BG),
-        ):
-            style.configure(
-                name,
-                background=BTN,
-                troughcolor=trough,
-                bordercolor=trough,
-                lightcolor=BTN,
-                darkcolor=BTN,
-                arrowcolor=MUTED,
-                relief="flat",
-                gripcount=0,
-                arrowsize=self.px(14),
-            )
-            style.map(name, background=[("active", BTN_HOVER)])
-
     def make_checkbox_images(self):
         # One picture per (ticked or not) x (row background). The background matters
         # because the picture's corners must blend into the row behind it.
@@ -496,6 +618,11 @@ class App:
         for checked in (False, True):
             for state, color in (("even", PANEL), ("odd", PANEL_ALT), ("select", SELECT)):
                 self.checkbox_images[(checked, state)] = draw_checkbox(self.root, size, checked, color, self.auto_col_width)
+
+    def make_scrollbar(self, parent, orient, command, track):
+        return RoundedScrollbar(
+            parent, orient, command, track, self.px(14), self.px(6), self.px(9)
+        )
 
     def make_button(self, parent, text, command, kind="normal", small=False):
         # kind picks the colors: "normal" (gray), "accent" (blue) or "danger" (red)
@@ -557,8 +684,8 @@ class App:
         ):
             self.tree.heading(col, text=title, anchor="w")
             self.tree.column(col, width=self.px(width), anchor="w", stretch=stretch)
-        tree_scroll = ttk.Scrollbar(table_inner, orient="vertical", command=self.tree.yview)
-        self.hscroll = ttk.Scrollbar(table_inner, orient="horizontal", command=self.tree.xview)
+        tree_scroll = self.make_scrollbar(table_inner, "vertical", self.tree.yview, PANEL)
+        self.hscroll = self.make_scrollbar(table_inner, "horizontal", self.tree.xview, PANEL)
         # xscrollcommand = "tell me how much is visible"; we use it to hide the bar when not needed
         self.tree.configure(yscrollcommand=tree_scroll.set, xscrollcommand=self.on_hscroll)
         tree_scroll.pack(side="right", fill="y")
@@ -628,9 +755,7 @@ class App:
             padx=self.px(12),
             pady=self.px(10),
         )
-        log_scroll = ttk.Scrollbar(
-            log_inner, orient="vertical", style="Log.Vertical.TScrollbar", command=self.log_text.yview
-        )
+        log_scroll = self.make_scrollbar(log_inner, "vertical", self.log_text.yview, LOG_BG)
         self.log_text.configure(yscrollcommand=log_scroll.set)
         log_scroll.pack(side="right", fill="y")
         self.log_text.pack(side="left", fill="both", expand=True)
