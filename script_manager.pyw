@@ -23,6 +23,16 @@ class ScriptEntry:
         # When it ends, poll() returns its exit code (0 = finished normally, 1 = crashed)
         return self.process is not None and self.process.poll() is None
 
+    def status_text(self):
+        if self.process is None:
+            return "Stopped"  # never started, or you stopped it yourself
+        code = self.process.poll()
+        if code is None:
+            return "Running"
+        if code == 0:
+            return "Finished"  # ended on its own, no errors
+        return f"Crashed ({code})"  # e.g. a missing library gives code 1
+
     def to_dict(self):
         # Path objects can't go into JSON, so we turn the path into plain text
         return {
@@ -138,15 +148,29 @@ class App:
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         self.refresh_table()
+        self.update_statuses()  # starts the once-per-second status loop
+
+    def update_statuses(self):
+        # Only change the Status cell of each row. We don't rebuild the table,
+        # so your selection and scroll position don't flicker every second.
+        for i, entry in enumerate(self.manager.entries):
+            iid = str(i)
+            if self.tree.exists(iid):
+                self.tree.set(iid, "status", entry.status_text())
+        # "Run this function again 1000 ms (1 second) from now".
+        # It reschedules itself every time, so it repeats forever without freezing the window.
+        self.root.after(1000, self.update_statuses)
 
     def refresh_table(self):
         selected = self.tree.selection()  # remember it, e.g. ("2",)
         self.tree.delete(*self.tree.get_children())  # clear all rows
         for i, entry in enumerate(self.manager.entries):
-            status = "Running" if entry.is_running() else "Stopped"
             # iid = the row's ID. Using the list index lets us find the entry again later
             self.tree.insert(
-                "", "end", iid=str(i), values=(entry.name, status, str(entry.path))
+                "",
+                "end",
+                iid=str(i),
+                values=(entry.name, entry.status_text(), str(entry.path)),
             )
         # Rebuilding the table clears the highlight, so put it back.
         # Otherwise after clicking Start you'd have to click the row again to Stop it.
