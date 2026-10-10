@@ -71,6 +71,18 @@ def open_in_system(path):
         subprocess.Popen(["xdg-open", str(path)])
 
 
+def format_duration(seconds):
+    """42 -> "42s", 312 -> "5m 12s", 3900 -> "1h 05m"."""
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, secs = divmod(seconds, 60)  # 312 -> 5 minutes and 12 seconds left over
+    if minutes < 60:
+        return f"{minutes}m {secs:02d}s"
+    hours, minutes = divmod(minutes, 60)  # 65 minutes -> 1 hour and 5 minutes left over
+    return f"{hours}h {minutes:02d}m"
+
+
 def plural(n, word):
     return f"{n} {word}" if n == 1 else f"{n} {word}s"
 
@@ -152,6 +164,7 @@ class ScriptEntry:
         self.path = Path(path)
         self.autostart = autostart  # start this script when the manager opens?
         self.process = None  # holds the running process, or None when stopped
+        self.started_at = 0.0  # when it was last started (time.monotonic), for the running time
 
     @property
     def log_path(self):
@@ -172,8 +185,14 @@ class ScriptEntry:
             return "running"
         return "finished" if code == 0 else "crashed"
 
+    def running_time(self):
+        """How long it has been running, in seconds."""
+        return time.monotonic() - self.started_at
+
     def status_text(self):
         kind = self.status_kind()
+        if kind == "running":
+            return f"Running · {format_duration(self.running_time())}"  # e.g. "Running · 5m 12s"
         if kind == "crashed":
             return f"Crashed ({self.process.poll()})"  # e.g. a missing library gives code 1
         return kind.capitalize()
@@ -271,7 +290,15 @@ class ScriptManager:
                 # output but leave stdin alone.
                 stdin=subprocess.DEVNULL,
             )
+        entry.started_at = time.monotonic()
         return True
+
+    def restart(self, entry):
+        """Stop it if it's running, then start it fresh. Returns False if the file is missing."""
+        if not entry.path.exists():
+            return False  # check first, so we don't stop it and then fail to start it
+        self.stop(entry)
+        return self.start(entry)
 
     def stop(self, entry):
         if entry.is_running():
@@ -532,8 +559,8 @@ class App:
 
         root.title("Script Manager")
         root.configure(bg=BG)
-        root.geometry(f"{self.px(840)}x{self.px(680)}")
-        root.minsize(self.px(740), self.px(520))
+        root.geometry(f"{self.px(900)}x{self.px(680)}")
+        root.minsize(self.px(860), self.px(520))
 
         self.setup_style()
         self.make_checkbox_images()
@@ -679,7 +706,7 @@ class App:
         self.tree.column("#0", width=self.auto_col_width, anchor="center", stretch=False)
         for col, title, width, stretch in (
             ("name", "Script", 170, False),
-            ("status", "Status", 160, False),
+            ("status", "Status", 200, False),
             ("path", "Path", 420, False),  # width is set by fit_path_column
         ):
             self.tree.heading(col, text=title, anchor="w")
@@ -723,7 +750,8 @@ class App:
         self.make_button(bar, "Remove", self.on_remove).pack(side="left", padx=(gap, 0))
         self.make_button(bar, "Stop All", self.on_stop_all, "danger").pack(side="right")
         self.make_button(bar, "Stop", self.on_stop).pack(side="right", padx=gap)
-        self.make_button(bar, "Start", self.on_start, "accent").pack(side="right")
+        self.make_button(bar, "Restart", self.on_restart).pack(side="right")
+        self.make_button(bar, "Start", self.on_start, "accent").pack(side="right", padx=(0, gap))
 
         # --- output box ---
         log_header = ttk.Frame(root)
@@ -1036,6 +1064,16 @@ class App:
             messagebox.showerror("Can't start", f"File not found:\n{entry.path}")
         elif entry is self.viewed_entry:
             self.show_log_for(entry)  # Start wiped the old log, so reload the box from the top
+        self.refresh_table()
+
+    def on_restart(self):
+        entry = self.get_selected()
+        if entry is None:
+            return
+        if not self.manager.restart(entry):
+            messagebox.showerror("Can't restart", f"File not found:\n{entry.path}")
+        elif entry is self.viewed_entry:
+            self.show_log_for(entry)  # fresh log, reload the box from the top
         self.refresh_table()
 
     def on_stop(self):

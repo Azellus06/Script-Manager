@@ -1,2 +1,3 @@
 scripts.json
-__pycache__/logs/
+__pycache__/
+logs/
