@@ -32,12 +32,26 @@ PANEL_ALT = "#22262e"  # every second table row (stripes)
 BORDER = "#2e333d"
 TEXT = "#e7e9ee"
 MUTED = "#8c94a6"
-ACCENT = "#4c8dff"  # Start button, ticked checkbox
+ACCENT = "#4c8dff"  # Restart button, ticked checkbox
 ACCENT_HOVER = "#6aa1ff"  # when the mouse is over it
 ACCENT_PRESS = "#3a78e6"  # while the mouse button is held down
-DANGER = "#d64550"  # Stop All button
-DANGER_HOVER = "#e5636d"
-DANGER_PRESS = "#bb3640"
+# Action buttons: medium-dark tinted fills with softly colored text, so they stay calm on the dark background
+GO = "#275c45"  # Start
+GO_HOVER = "#2f6e54"
+GO_PRESS = "#1f4a39"
+GO_TEXT = "#8ee3b9"
+INFO = "#2a4473"  # Restart
+INFO_HOVER = "#335187"
+INFO_PRESS = "#213960"
+INFO_TEXT = "#a9c6f8"
+WARN = "#754d23"  # Stop
+WARN_HOVER = "#875c2c"
+WARN_PRESS = "#5f3f1c"
+WARN_TEXT = "#f2c58a"
+DANGER = "#753038"  # Stop All
+DANGER_HOVER = "#873c46"
+DANGER_PRESS = "#5f262d"
+DANGER_TEXT = "#f7a3ac"
 BTN = "#2a2f39"  # normal buttons
 BTN_HOVER = "#363c49"
 BTN_PRESS = "#20242c"
@@ -652,11 +666,14 @@ class App:
         )
 
     def make_button(self, parent, text, command, kind="normal", small=False):
-        # kind picks the colors: "normal" (gray), "accent" (blue) or "danger" (red)
+        # kind picks the colors: normal (gray), go (green), info (blue), warn (orange), danger (red)
         colors = {
             "normal": (BTN, BTN_HOVER, BTN_PRESS, TEXT, FONT),
+            "go": (GO, GO_HOVER, GO_PRESS, GO_TEXT, FONT_BOLD),
+            "warn": (WARN, WARN_HOVER, WARN_PRESS, WARN_TEXT, FONT_BOLD),
+            "info": (INFO, INFO_HOVER, INFO_PRESS, INFO_TEXT, FONT_BOLD),
             "accent": (ACCENT, ACCENT_HOVER, ACCENT_PRESS, "#ffffff", FONT_BOLD),
-            "danger": (DANGER, DANGER_HOVER, DANGER_PRESS, "#ffffff", FONT_BOLD),
+            "danger": (DANGER, DANGER_HOVER, DANGER_PRESS, DANGER_TEXT, FONT_BOLD),
         }
         bg, hover, press, fg, font = colors[kind]
         if small:
@@ -749,9 +766,9 @@ class App:
         self.make_button(bar, "Add Folder", self.on_add_folder).pack(side="left", padx=(gap, 0))
         self.make_button(bar, "Remove", self.on_remove).pack(side="left", padx=(gap, 0))
         self.make_button(bar, "Stop All", self.on_stop_all, "danger").pack(side="right")
-        self.make_button(bar, "Stop", self.on_stop).pack(side="right", padx=gap)
-        self.make_button(bar, "Restart", self.on_restart).pack(side="right")
-        self.make_button(bar, "Start", self.on_start, "accent").pack(side="right", padx=(0, gap))
+        self.make_button(bar, "Stop", self.on_stop, "warn").pack(side="right", padx=gap)
+        self.make_button(bar, "Restart", self.on_restart, "info").pack(side="right")
+        self.make_button(bar, "Start", self.on_start, "go").pack(side="right", padx=(0, gap))
 
         # --- output box ---
         log_header = ttk.Frame(root)
