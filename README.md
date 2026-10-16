@@ -7,8 +7,8 @@ A small desktop app (Python + tkinter) to add, start, stop and monitor my own au
 ## Features
 
 - **One list for all scripts**: add a single script, or a whole folder at once.
-- **Start / Restart / Stop / Stop All**, with a live status for each script (running, stopped, finished, crashed) and how long a running script has been up.
-- **Live output**: select a script to see what it prints, with errors shown in red. Output is also saved to `logs/<script name>.log`.
+- **Start/Stop** (one button that flips to Stop while the selected script runs), **Restart** and **Stop All**, with a live status for each script (running, stopped, finished, crashed) and how long a running script has been up.
+- **Live output**: select a script to see what it prints, with errors shown in red. Output is also saved to `logs/<script name>.log` (if two scripts share a file name, each gets a short code added, e.g. `logs/bot-3f9a1c.log`).
 - **Auto-start**: tick the box next to a script and it starts whenever the manager opens. Unticked by default, so nothing runs without your say-so.
 - **Emergency stop**: press `Ctrl+Alt+X` from anywhere to stop every script.
 - **Open Log / Open Folder** buttons for the selected script.
@@ -38,7 +38,7 @@ The `.pyw` extension means no console window opens. If the window ever fails to 
 | **Add Folder** | Add every `.py` / `.pyw` directly inside a folder (skips subfolders, files starting with `_`, and duplicates) |
 | Click a row | See its output below |
 | Click the box in **Auto-start** | Start that script every time the manager opens |
-| **Start** / **Stop** | Run or stop the selected script |
+| **Start** / **Stop** | One button: green Start runs the selected script, and it turns into orange Stop while the script is running (gray when nothing is selected) |
 | **Restart** | Stop the selected script and start it again fresh (log and running time reset) |
 | **Stop All** or `Ctrl+Alt+X` | Stop everything |
 | **Open Log** / **Open Folder** | Open the selected script's log file or its folder |
@@ -57,6 +57,5 @@ Everything except the optional hotkey uses only Python's standard library.
 
 ## Known limits
 
-- Two scripts with the same file name in different folders share one log file.
 - A script's log is wiped each time you press Start.
 - Closing the manager stops all running scripts.

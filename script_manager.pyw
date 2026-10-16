@@ -1,3 +1,4 @@
+import hashlib
 import json
 import math
 import os
@@ -55,6 +56,7 @@ DANGER_TEXT = "#f7a3ac"
 BTN = "#2a2f39"  # normal buttons
 BTN_HOVER = "#363c49"
 BTN_PRESS = "#20242c"
+OFF_TEXT = "#5d6474"  # text of a button that can't be clicked right now
 BUTTON_RADIUS = 10  # how round the button corners are (0 = sharp, 18 = fully round ends)
 GREEN = "#3ecf8e"  # running
 RED = "#ff6b78"  # crashed / error lines
@@ -179,11 +181,13 @@ class ScriptEntry:
         self.autostart = autostart  # start this script when the manager opens?
         self.process = None  # holds the running process, or None when stopped
         self.started_at = 0.0  # when it was last started (time.monotonic), for the running time
+        # Usually the same as name. ScriptManager adds a code when two scripts share a name.
+        self.log_name = name
 
     @property
     def log_path(self):
         # e.g. autoclicker.py -> logs/autoclicker.log
-        return LOG_DIR / f"{self.name}.log"
+        return LOG_DIR / f"{self.log_name}.log"
 
     def is_running(self):
         # poll() returns None while the script is still running.
@@ -208,7 +212,7 @@ class ScriptEntry:
         if kind == "running":
             return f"Running · {format_duration(self.running_time())}"  # e.g. "Running · 5m 12s"
         if kind == "crashed":
-            return f"Crashed ({self.process.poll()})"  # e.g. a missing library gives code 1
+            return f"Crashed (exit {self.process.poll()})"  # e.g. a missing library gives exit 1
         return kind.capitalize()
 
     def to_dict(self):
@@ -237,6 +241,29 @@ class ScriptManager:
                 self.entries = [ScriptEntry.from_dict(d) for d in json.load(f)]
         except (json.JSONDecodeError, KeyError):
             self.entries = []  # broken file -> start with an empty list
+        self.update_log_names()
+
+    def log_name_for(self, entry):
+        """Picks the log file name for a script.
+
+        Only one bot.py in the list -> "bot".
+        Two different bot.py files (in folders a and b) -> "bot-3f9a1c" and "bot-8d02e7".
+        The code comes from the full path, so the same file always gets the same code.
+        """
+        same_name = [e for e in self.entries if e.name.lower() == entry.name.lower()]
+        if len(same_name) <= 1:
+            return entry.name
+        # md5 turns the path into a long fixed code; we keep the first 6 characters.
+        # lower() because Windows treats "C:/Bots" and "c:/bots" as the same folder.
+        code = hashlib.md5(str(entry.path).lower().encode("utf-8")).hexdigest()[:6]
+        return f"{entry.name}-{code}"
+
+    def update_log_names(self):
+        for entry in self.entries:
+            # A script that was started keeps its log name until it starts again,
+            # so its output box doesn't suddenly switch to a different file.
+            if entry.process is None:
+                entry.log_name = self.log_name_for(entry)
 
     def save(self):
         with open(self.data_file, "w", encoding="utf-8") as f:
@@ -247,6 +274,7 @@ class ScriptManager:
         if any(e.path == path for e in self.entries):
             return False  # already in the list
         self.entries.append(ScriptEntry(path.stem, path))
+        self.update_log_names()
         if save:
             self.save()
         return True
@@ -279,6 +307,7 @@ class ScriptManager:
     def remove_script(self, entry):
         self.stop(entry)  # don't leave a removed script running with no way to stop it
         self.entries.remove(entry)
+        self.update_log_names()
         self.save()
 
     def start(self, entry):
@@ -288,6 +317,7 @@ class ScriptManager:
         if not entry.path.exists():
             return False
         LOG_DIR.mkdir(exist_ok=True)
+        entry.log_name = self.log_name_for(entry)  # pick it fresh on every start
         # Opening with "w" empties the old log, so each Start gives a fresh log.
         # The script gets its own copy of this file handle, so we can close ours
         # right after Popen (that's what the "with" block does).
@@ -513,6 +543,9 @@ class RoundedButton(tk.Canvas):
         self.command = command
         self.colors = {"normal": bg, "hover": hover, "press": press}
         self.pressed = False
+        self.hovering = False
+        self.enabled = True
+        self.look = None  # remembers the last set_look() call, to skip repeats
 
         # r = corner size. It can't be more than half the button's height or width.
         r = min(radius, height // 2, width // 2)
@@ -527,16 +560,36 @@ class RoundedButton(tk.Canvas):
             x1, y1,
         ]  # fmt: skip
         self.shape = self.create_polygon(points, smooth=True, fill=bg, outline=bg)
-        self.create_text(width // 2, height // 2, text=text, fill=fg, font=font)
+        self.label = self.create_text(width // 2, height // 2, text=text, fill=fg, font=font)
 
-        self.bind("<Enter>", lambda e: self.paint("hover"))
-        self.bind("<Leave>", lambda e: self.paint("normal"))
+        self.bind("<Enter>", self.on_enter)
+        self.bind("<Leave>", self.on_leave)
         self.bind("<ButtonPress-1>", self.on_press)
         self.bind("<ButtonRelease-1>", self.on_release)
+
+    def set_look(self, text, bg, hover, press, fg, font, enabled=True):
+        """Change the text and colors in place. Used by the Start/Stop button."""
+        look = (text, bg, fg, enabled)
+        if look == self.look:
+            return  # nothing changed (this runs every second, so skip the work)
+        self.look = look
+        self.enabled = enabled
+        self.colors = {"normal": bg, "hover": hover, "press": press}
+        self.itemconfig(self.label, text=text, fill=fg, font=font)
+        self.configure(cursor="hand2" if enabled else "arrow")
+        self.paint("hover" if self.hovering else "normal")
 
     def paint(self, state):
         color = self.colors[state]
         self.itemconfig(self.shape, fill=color, outline=color)
+
+    def on_enter(self, event):
+        self.hovering = True
+        self.paint("hover")
+
+    def on_leave(self, event):
+        self.hovering = False
+        self.paint("normal")
 
     def on_press(self, event):
         self.pressed = True
@@ -547,7 +600,7 @@ class RoundedButton(tk.Canvas):
         # (Press, drag away, release = cancelled, like a normal button.)
         inside = 0 <= event.x < self.winfo_width() and 0 <= event.y < self.winfo_height()
         self.paint("hover" if inside else "normal")
-        if self.pressed and inside:
+        if self.pressed and inside and self.enabled:
             self.command()
         self.pressed = False
 
@@ -665,17 +718,20 @@ class App:
             parent, orient, command, track, self.px(14), self.px(6), self.px(9)
         )
 
+    # kind picks the colors: normal (gray), go (green), info (blue), warn (orange), danger (red),
+    # off (gray with dim text, for a button that can't be clicked right now)
+    BUTTON_COLORS = {
+        "normal": (BTN, BTN_HOVER, BTN_PRESS, TEXT, FONT),
+        "go": (GO, GO_HOVER, GO_PRESS, GO_TEXT, FONT_BOLD),
+        "warn": (WARN, WARN_HOVER, WARN_PRESS, WARN_TEXT, FONT_BOLD),
+        "info": (INFO, INFO_HOVER, INFO_PRESS, INFO_TEXT, FONT_BOLD),
+        "accent": (ACCENT, ACCENT_HOVER, ACCENT_PRESS, "#ffffff", FONT_BOLD),
+        "danger": (DANGER, DANGER_HOVER, DANGER_PRESS, DANGER_TEXT, FONT_BOLD),
+        "off": (BTN, BTN, BTN, OFF_TEXT, FONT_BOLD),
+    }
+
     def make_button(self, parent, text, command, kind="normal", small=False):
-        # kind picks the colors: normal (gray), go (green), info (blue), warn (orange), danger (red)
-        colors = {
-            "normal": (BTN, BTN_HOVER, BTN_PRESS, TEXT, FONT),
-            "go": (GO, GO_HOVER, GO_PRESS, GO_TEXT, FONT_BOLD),
-            "warn": (WARN, WARN_HOVER, WARN_PRESS, WARN_TEXT, FONT_BOLD),
-            "info": (INFO, INFO_HOVER, INFO_PRESS, INFO_TEXT, FONT_BOLD),
-            "accent": (ACCENT, ACCENT_HOVER, ACCENT_PRESS, "#ffffff", FONT_BOLD),
-            "danger": (DANGER, DANGER_HOVER, DANGER_PRESS, DANGER_TEXT, FONT_BOLD),
-        }
-        bg, hover, press, fg, font = colors[kind]
+        bg, hover, press, fg, font = self.BUTTON_COLORS[kind]
         if small:
             padx, pady, radius, min_width = self.px(12), self.px(4), self.px(8), self.px(88)
         else:
@@ -766,9 +822,10 @@ class App:
         self.make_button(bar, "Add Folder", self.on_add_folder).pack(side="left", padx=(gap, 0))
         self.make_button(bar, "Remove", self.on_remove).pack(side="left", padx=(gap, 0))
         self.make_button(bar, "Stop All", self.on_stop_all, "danger").pack(side="right")
-        self.make_button(bar, "Stop", self.on_stop, "warn").pack(side="right", padx=gap)
-        self.make_button(bar, "Restart", self.on_restart, "info").pack(side="right")
-        self.make_button(bar, "Start", self.on_start, "go").pack(side="right", padx=(0, gap))
+        self.make_button(bar, "Restart", self.on_restart, "info").pack(side="right", padx=gap)
+        # One button for Start and Stop. sync_toggle() swaps its text and color.
+        self.toggle_btn = self.make_button(bar, "Start", self.on_toggle, "go")
+        self.toggle_btn.pack(side="right")
 
         # --- output box ---
         log_header = ttk.Frame(root)
@@ -858,13 +915,14 @@ class App:
                 self.tree.item(iid, tags=self.row_tags(i, entry))
         self.update_summary()
         self.update_log()
+        self.sync_toggle()  # a script that ended by itself flips the button back to Start
         # "Run this function again 1000 ms (1 second) from now".
         # It reschedules itself every time, so it repeats forever without freezing the window.
         self.root.after(1000, self.tick)
 
     @staticmethod
     def status_label(entry):
-        # e.g. "● Running", "✕ Crashed (1)"  (the icon helps even if you can't tell the colors apart)
+        # e.g. "● Running", "✕ Crashed (exit 1)"  (the icon helps even if you can't tell the colors apart)
         return f"{STATUS_ICONS[entry.status_kind()]} {entry.status_text()}"
 
     @staticmethod
@@ -956,6 +1014,7 @@ class App:
         else:
             self.empty_label.place(relx=0.5, rely=0.55, anchor="center")
         self.update_summary()
+        self.sync_toggle()
 
     def get_selected(self):
         selected = self.tree.selection()  # e.g. ("2",)
@@ -1023,6 +1082,7 @@ class App:
 
     def on_select(self, event=None):
         self.refresh_checkboxes()  # the highlighted row needs its own checkbox picture
+        self.sync_toggle()
         entry = self.get_selected()
         # Rebuilding the table briefly empties the selection; ignore that so
         # the output box doesn't blank out every time you click a button.
@@ -1031,6 +1091,30 @@ class App:
         self.show_log_for(entry)
 
     # ---------- buttons ----------
+
+    def sync_toggle(self):
+        """Make the Start/Stop button match the selected script.
+
+        No row selected  -> gray "Start", does nothing
+        bot.py stopped   -> green "Start"
+        bot.py running   -> orange "Stop"
+        """
+        entry = self.get_selected()
+        if entry is None:
+            self.toggle_btn.set_look("Start", *self.BUTTON_COLORS["off"], enabled=False)
+        elif entry.is_running():
+            self.toggle_btn.set_look("Stop", *self.BUTTON_COLORS["warn"])
+        else:
+            self.toggle_btn.set_look("Start", *self.BUTTON_COLORS["go"])
+
+    def on_toggle(self):
+        entry = self.get_selected()
+        if entry is None:
+            return
+        if entry.is_running():
+            self.on_stop()
+        else:
+            self.on_start()
 
     def on_add(self):
         path = filedialog.askopenfilename(
